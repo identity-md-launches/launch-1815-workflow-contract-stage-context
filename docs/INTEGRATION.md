@@ -10,9 +10,10 @@ No calls accept native ETH. Application amounts are 18-decimal IMD minor units.
 | --- | --- |
 | `create(uint256 amount,uint256 slots,bool lucky,address keyAddress,bytes32 salt,uint256 duration,bytes32 revealCommit) returns (uint256 id)` | Creator approves/pays gross IMD; returns the next id, beginning at 1 |
 | `grab(uint256 id,address recipient,bytes signature)` | Anyone relays a 65-byte ECDSA signature; pays only its recipient for an equal packet |
-| `reveal(uint256 id,bytes32 secret)` | Packet creator only; full or expired lucky packet; pays all grabbers and refunds remainder atomically |
-| `settle(uint256 id)` | Anyone; open lucky packet at or after `settlementTime(id)`; equal fallback |
-| `refund(uint256 id)` | Anyone; open equal packet at or after expiry; remainder goes to creator |
+| `reveal(uint256 id,bytes32 secret)` | Packet creator only; full or expired lucky packet; pays all grabbers and refunds remainder atomically, reverting if IMD refuses any of them |
+| `settle(uint256 id)` | Anyone; open lucky packet at or after `settlementTime(id)`; equal fallback; a refused recipient is credited, never blocking |
+| `refund(uint256 id)` | Anyone; open equal packet at or after expiry; remainder goes to creator, or is credited if IMD refuses the creator |
+| `claim(address recipient,address to) returns (uint256 amount)` | Pays `claimable(recipient)` to `to`; anyone when `to == recipient`, only `recipient` otherwise |
 | `recoverSurplus() returns (uint256 amount)` | Anyone; transfers only unsolicited IMD above `totalEscrow` to the caller |
 
 `create` requires `net = amount - floor(amount / 200) >= slots * 10^16`.
@@ -107,8 +108,8 @@ separate even from the shared passphrase and its derived signing key.
 | `Open` | 0 | Created; may already be full/expired while awaiting terminal action |
 | `Completed` | 1 | Final equal grab paid |
 | `Revealed` | 2 | Lucky creator reveal and all transfers succeeded |
-| `Settled` | 3 | Lucky equal fallback and all transfers succeeded |
-| `Refunded` | 4 | Expired equal packet's remainder returned |
+| `Settled` | 3 | Lucky equal fallback; every share paid, or credited in `claimable` where IMD refused |
+| `Refunded` | 4 | Expired equal packet's remainder returned to the creator, or credited where IMD refused |
 
 Unknown ids revert from `packet`, `grabbers`, `settlementTime`, and packet-mutating calls. A
 default-zero mapping value does not prove a packet exists. All terminal transitions are final.
@@ -120,7 +121,10 @@ Other views:
   shares stay zero while Open, including after a reverted reveal. Equal shares are immediately final.
 - `hasGrabbed(id, recipient)` records duplicate prevention; a failed transaction does not set it.
 - `remaining(id)` is a packet's unpaid liability, zero after a terminal state.
-- `totalEscrow()` is the sum of all remaining liabilities, not the raw token balance.
+- `claimable(address)` is IMD a settle or refund could not deliver to that address. It is released
+  by `claim`, never by `recoverSurplus`.
+- `totalEscrow()` is the sum of all remaining liabilities plus all `claimable` credits, not the raw
+  token balance.
 - `filledAt(id)` is the timestamp of the final grab, or zero before filling.
 - `settlementTime(id)` is `filledAt + 86400` if full, otherwise `expiry + 86400`, for lucky
   packets. It can move earlier when the final slot is grabbed. It does not imply the packet is Open.
@@ -163,7 +167,34 @@ for i in [0, g):
 
 The seed uses standard ABI encoding (including the address-array offset and length), **not packed
 encoding**. Rejection sampling removes integer-modulo bias under the hash-randomness model.
-This does not remove creator choice, knowledge of the secret, or ordering influence.
+This does not remove creator choice, knowledge of the secret, or ordering influence. In particular
+the creator, who knows the secret and the passphrase, can grind the last grabber address: evaluate
+this algorithm offline for many addresses of their own and submit the one that minimises the real
+grabbers' shares before revealing. The site copy and result page must not describe the lucky split as
+fair or unbiased; present it as the sender's draw.
+
+## Deferred payouts
+
+`reveal` and an equal `grab` are all-or-nothing: if IMD refuses one recipient's transfer, the whole
+call reverts and nothing is recorded. `settle` and `refund` must always finish, so there each
+transfer is attempted and, if IMD refuses it (the `transfer` call reverts, returns false or moves
+nothing), the amount is added to `claimable(recipient)` and `PayoutDeferred(id, recipient, amount)`
+is emitted after the `Settled` or `Refunded` event. The packet is terminal and `grabbers(id)`
+shows the credited share like any other. A transfer that moves balances by the wrong amount is a
+broken token, not a refusal, and still reverts the whole call with `InexactTransfer`.
+
+`claim(recipient, to)` releases a credit. With `to == recipient` anyone may call it (a friend can
+pay the gas, the IMD only reaches the recipient). With a different `to` the caller must be the
+recipient, which lets an address the IMD owner blocklisted move its credit to another address. It
+reverts with `NothingToClaim` when the credit is zero, `NotRecipient` for a third party redirecting,
+`InvalidRecipient` for a zero or box destination, and with the IMD error if IMD still refuses `to`;
+a failed claim keeps the credit. Credits are counted in `totalEscrow`, so `recoverSurplus` cannot
+touch them.
+
+For the frontend: after `Settled`/`Refunded`, read `claimable` for the connected wallet (and the
+creator) and offer a claim button when it is nonzero. A reveal that fails with the IMD blocklist
+error means one recipient is refused; the creator should wait for `settlementTime(id)` and anyone
+can then `settle`.
 
 The reserve cap is necessary to satisfy the minimum: drawing from an uncapped double-average
 range could give all of a 0.02 IMD two-slot packet to the first recipient and leave the last with
@@ -200,10 +231,13 @@ All events are in the ABI, including their indexed fields. Application events ar
 | `Settled` | Indexed id; total fallback payout and creator refund |
 | `Refunded` | Indexed id/creator; expired equal packet refund |
 | `SurplusRecovered` | Indexed caller/recipient and unassigned amount recovered |
+| `PayoutDeferred` | Indexed id/recipient; amount a settle or refund could not deliver, now in `claimable` |
+| `Claimed` | Indexed recipient/destination; credit released by `claim` |
 
 For lucky allocations, refetch `grabbers(id)` after `Revealed` or `Settled` to obtain final shares.
 `Refunded` is the equal-packet terminal event; lucky refunds are included in `Revealed`/`Settled`.
 `Grabbed` for the final equal slot implies `Completed`. Failed transactions retain no logs.
+`PayoutDeferred` follows `Settled` or `Refunded` in the same transaction, one per refused address.
 
 User-facing error groups:
 
@@ -214,6 +248,7 @@ User-facing error groups:
 - Lifecycle failures: `NotLucky`, `NotEqual`, `NotCreator`, `NotReady`, `WrongSecret`,
   `TooEarly(availableAt)`.
 - Asset failures: `InexactTransfer`, `NoSurplus`, underlying ERC-20 errors, or SafeERC20 errors.
+- Claim failures: `NothingToClaim`, `NotRecipient`, `InvalidRecipient`.
 - A reentrant state change fails with OpenZeppelin `ReentrancyGuardReentrantCall`.
 
 `PacketClosed` takes precedence over mode/timing errors on terminal packets. Recovery UI should

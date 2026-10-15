@@ -101,7 +101,14 @@ abstract contract HongbaoTestBase is Test {
             assertEq(box.remaining(id), owed, "per packet liability");
             sum += owed;
         }
+        sum += _claimableSum();
         assertEq(box.totalEscrow(), sum, "global liability");
         assertEq(imd.balanceOf(address(box)), sum, "balance equals liabilities");
+    }
+
+    /// @dev Deferred credits of every actor these tests pay; the box owes them like open packets.
+    function _claimableSum() internal view returns (uint256) {
+        return box.claimable(creator) + box.claimable(alice) + box.claimable(bob) + box.claimable(carol)
+            + box.claimable(relayer);
     }
 }

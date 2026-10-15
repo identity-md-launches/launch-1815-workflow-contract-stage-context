@@ -21,27 +21,40 @@ claimed live-chain verification of the supplied IMD contract.
 3. **Reentrancy and atomicity.** Every public mutator shares a ReentrancyGuard. All terminal
    state and per-recipient shares are recorded before payout calls. Incoming balance checks
    necessarily bracket a transferFrom before the new escrow entry; the guard covers that
-   transient period. No callbacks can claim incoming deposits or unpaid batch amounts as
-   surplus. A failure at any payout/refund rolls back all earlier transfers in that transaction.
+   transient period. No callbacks can claim incoming deposits, unpaid batch amounts or deferred
+   credits as surplus. In `create`, equal `grab`, `reveal`, `claim` and `recoverSurplus` a
+   failed transfer rolls back the whole transaction. In `settle` and `refund` a transfer IMD
+   refuses is credited instead (item 5); a transfer that moves balances inexactly still rolls back.
 4. **Liveness.** Equal funds have an expiry refund path; lucky funds have an unconditional
    equal fallback after the grace period. No reveal secret or creator cooperation is needed for
-   fallback. Unsolicited IMD above all liabilities is publicly recoverable, with no privileged
-   beneficiary and no claim priority for the direct sender. This auxiliary function does not
-   change any packet's budget. Third-party assets/native ETH are not accepted or managed.
-5. **External token failure.** An IMD pause, receiver blocklist, rebase, confiscation or upgrade
-   can prevent transfers and therefore freeze a batch until resolved externally. The specified
-   atomic push payout cannot simultaneously guarantee progress under a permanently blocked
-   recipient. No admin bypass, substitute recipient or partial-distribution semantics have been
-   introduced. The immutable token address and these external risks require independent review.
+   fallback, and no single recipient can block it. Unsolicited IMD above all liabilities is
+   publicly recoverable, with no privileged beneficiary and no claim priority for the direct
+   sender. This auxiliary function does not change any packet's budget or any credit.
+   Third-party assets/native ETH are not accepted or managed.
+5. **External token failure.** The live IMD token is owner-controlled with a recipient blocklist
+   (`blocked(address)`) and a global transfer switch, as the independent review confirmed on chain
+   4663. A blocked grabber or creator therefore had to be handled, including one planted by a
+   passphrase holder who signs `Grab` for an already-blocked address. Resolution: `settle` and
+   `refund` attempt each transfer with a low-level call bracketed by exact balance checks; a
+   refusal (revert, false, or no balance movement) becomes `claimable[recipient]`, counted in
+   `totalEscrow` and released by `claim`, which the recipient may redirect to another address.
+   `reveal` keeps the brief's atomic "pays every grabber in the same transaction" semantics and
+   reverts on a refused recipient, so a planted blocked address can at worst force the equal
+   fallback, never a loss. Still outside the contract's control: IMD blocking the box itself as
+   sender, disabling transfers globally, confiscating, rebasing or upgrading; every payout then
+   waits for the IMD owner. The immutable token address and these risks require independent review.
 6. **Signatures.** OpenZeppelin low-s ECDSA recovery checks the EIP-712 digest, packet id,
    recipient, current chain id and deployment address. Used recipients remain marked forever.
    A copied signature only pays the original recipient. Invalid signatures, zero recipients and
    the box itself cannot consume slots. A smart-wallet recipient needs no custom approval.
 7. **Randomness.** The creator knows the secret before creation, can simulate allocations and
    can choose reveal versus equal fallback. Passphrase holders can submit Sybil recipients, and
-   the Robinhood sequencer orders transactions. Commit/reveal and rejection sampling make
-   allocation reproducible, not unbiased or censorship-resistant. This follows the approved
-   design, with these trust assumptions explicitly exposed to users.
+   the Robinhood sequencer orders transactions. Because the creator holds both the secret and
+   the passphrase, they can grind the final grabber address to pick the outcome (the review's
+   check found a steering address within a few hundred candidates). Commit/reveal and rejection
+   sampling make allocation reproducible, not unbiased or censorship-resistant. This follows the
+   approved seed formula; README and INTEGRATION tell the site to present the split as the
+   sender's draw, not a fair one. No code change was made for this.
 8. **Limits and rounding.** At most 200 recipients bound every loop. The minimum-reserving
    cap resolves the double-average/minimum-share conflict. The original net amount never
    changes; independent remaining-liability accounting prevents cross-packet leakage. Full-
@@ -60,8 +73,8 @@ claimed live-chain verification of the supplied IMD contract.
 | `HongbaoBox.t.sol` | Burn/net accounting, input bounds, minimum after burn, equal payout/refund, lifecycle, surplus isolation |
 | `HongbaoSignatures.t.sol` | Independent typed-data encoding, recipient/id/address/chain binding, duplicates and signature malleability |
 | `HongbaoLucky.t.sol` | Partial/full/empty reveal and fallback, deadlines, minimum reserves, exact sums, best luck, maximum integers, published draw vector |
-| `HongbaoFailures.t.sol` | Fee/bonus/no-op/false/no-return tokens, transfer rollback/retry, blocked recipients, all mutator reentry, surplus during callbacks |
-| `HongbaoInvariant.t.sol` | Random mixed-packet histories, independent liabilities, balance/supply conservation, unique recipients, terminal-state preservation, final drainability |
+| `HongbaoFailures.t.sol` | Fee/bonus/no-op/false/no-return tokens, transfer rollback/retry, blocked grabber and creator under settle/refund with credits and claims, redirect authority, surplus isolation of credits, all mutator reentry, surplus during callbacks |
+| `HongbaoInvariant.t.sol` | Random mixed-packet histories with a modelled IMD blocklist, independent liabilities including credits, balance/supply conservation, unique recipients, terminal-state preservation, final drainability through fallbacks and claims |
 | `LaunchCompatibility.t.sol` | Empty-chain factory-style constructors, preserved launch supply, EIP-170 sizes and forbidden runtime opcodes |
 
 The supplied protected tests are external verification inputs and are not modified or copied into

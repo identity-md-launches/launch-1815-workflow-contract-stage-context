@@ -119,34 +119,195 @@ contract HongbaoFailuresTest is HongbaoTestBase {
         _assertAccounting();
     }
 
-    function testSettleRefundFailureRollsBackAllRecipientsAndCanRetry() public {
+    /// @dev The reviewer's scenario: one blocked grabber must not strand the others or the creator.
+    function testBlockedGrabberCannotStrandLuckyPacketSettlePaysOthersAndCreditsThem() public {
+        uint256 id = _create(100 ether, 3, true);
+        uint256 net = box.packet(id).amount;
+        _grab(id, alice);
+        _grab(id, bob);
+        imd.setBlocked(bob);
+        vm.warp(box.settlementTime(id));
+        // The atomic reveal cannot complete while IMD refuses bob.
+        vm.expectRevert(MockIMD.Blocked.selector);
+        _reveal(id);
+        _assertUnpaidLucky(id, 2);
+        // The permissionless fallback finishes anyway.
+        uint256 payout = net * 2 / 3;
+        uint256 creatorBefore = imd.balanceOf(creator);
+        vm.expectEmit(address(box));
+        emit HongbaoBox.Settled(id, payout, net - payout);
+        vm.expectEmit(address(box));
+        emit HongbaoBox.PayoutDeferred(id, bob, payout - payout / 2);
+        vm.prank(relayer);
+        box.settle(id);
+        assertEq(uint256(box.packet(id).state), uint256(HongbaoBox.State.Settled));
+        assertEq(imd.balanceOf(alice), payout / 2, "alice paid");
+        assertEq(imd.balanceOf(bob), 0, "bob not paid by IMD");
+        assertEq(box.claimable(bob), payout - payout / 2, "bob credited");
+        assertEq(imd.balanceOf(creator) - creatorBefore, net - payout, "creator refunded");
+        assertEq(box.remaining(id), 0);
+        assertEq(box.totalEscrow(), box.claimable(bob), "credit stays inside escrow");
+        (, uint256[] memory shares) = box.grabbers(id);
+        assertEq(shares[1], box.claimable(bob));
+        _assertAccounting();
+        // Nobody can take the credit as surplus, reveal and settle are closed, and claim pays bob.
+        vm.expectRevert(HongbaoBox.NoSurplus.selector);
+        box.recoverSurplus();
+        vm.expectRevert(HongbaoBox.PacketClosed.selector);
+        _reveal(id);
+        vm.expectRevert(HongbaoBox.PacketClosed.selector);
+        box.settle(id);
+        imd.setBlocked(address(0));
+        vm.expectEmit(address(box));
+        emit HongbaoBox.Claimed(bob, bob, payout - payout / 2);
+        vm.prank(relayer);
+        assertEq(box.claim(bob, bob), payout - payout / 2);
+        assertEq(imd.balanceOf(bob), payout - payout / 2);
+        assertEq(box.claimable(bob), 0);
+        assertEq(box.totalEscrow(), 0);
+        _assertAccounting();
+    }
+
+    function testSettleCreditsBlockedCreatorRefundAndCreatorCanRedirectIt() public {
         uint256 id = _create(1 ether, 3, true);
+        uint256 net = box.packet(id).amount;
         _grab(id, alice);
         _grab(id, bob);
         vm.warp(box.settlementTime(id));
         imd.setBlocked(creator);
-        vm.expectRevert(MockIMD.Blocked.selector);
         box.settle(id);
-        _assertUnpaidLucky(id, 2);
-        imd.setBlocked(address(0));
-        box.settle(id);
+        assertEq(uint256(box.packet(id).state), uint256(HongbaoBox.State.Settled));
         assertGt(imd.balanceOf(alice), 0);
+        assertGt(imd.balanceOf(bob), 0);
+        assertEq(box.claimable(creator), net - net * 2 / 3);
+        _assertAccounting();
+        // While IMD still refuses the creator's address, only the creator may redirect the credit.
+        vm.expectRevert(HongbaoBox.NotRecipient.selector);
+        vm.prank(relayer);
+        box.claim(creator, relayer);
+        vm.expectRevert(MockIMD.Blocked.selector);
+        vm.prank(relayer);
+        box.claim(creator, creator);
+        assertEq(box.claimable(creator), net - net * 2 / 3, "failed claim keeps the credit");
+        vm.prank(creator);
+        assertEq(box.claim(creator, carol), net - net * 2 / 3);
+        assertEq(imd.balanceOf(carol), net - net * 2 / 3);
+        assertEq(box.claimable(creator), 0);
         _assertAccounting();
     }
 
-    function testEqualRefundFailureLeavesRecoverableLiability() public {
+    function testEqualRefundCreditsBlockedCreatorInsteadOfRevertingForever() public {
         uint256 id = _create(1 ether, 3, false);
         _grab(id, alice);
         vm.warp(box.packet(id).expiry);
-        uint256 beforeRemaining = box.remaining(id);
+        uint256 owed = box.remaining(id);
+        uint256 creatorBefore = imd.balanceOf(creator);
         imd.setBlocked(creator);
-        vm.expectRevert(MockIMD.Blocked.selector);
+        vm.expectEmit(address(box));
+        emit HongbaoBox.PayoutDeferred(id, creator, owed);
         box.refund(id);
-        assertEq(box.remaining(id), beforeRemaining);
-        assertEq(uint256(box.packet(id).state), uint256(HongbaoBox.State.Open));
+        assertEq(uint256(box.packet(id).state), uint256(HongbaoBox.State.Refunded));
+        assertEq(box.remaining(id), 0);
+        assertEq(box.claimable(creator), owed);
+        assertEq(imd.balanceOf(creator), creatorBefore);
+        _assertAccounting();
+        vm.expectRevert(HongbaoBox.PacketClosed.selector);
+        box.refund(id);
+        imd.setBlocked(address(0));
+        box.claim(creator, creator);
+        assertEq(imd.balanceOf(creator), creatorBefore + owed);
+        _assertAccounting();
+    }
+
+    function testClaimRejectsEmptyCreditsAndInvalidDestinations() public {
+        vm.expectRevert(HongbaoBox.InvalidRecipient.selector);
+        box.claim(alice, address(0));
+        vm.expectRevert(HongbaoBox.InvalidRecipient.selector);
+        box.claim(alice, address(box));
+        vm.expectRevert(HongbaoBox.NothingToClaim.selector);
+        box.claim(alice, alice);
+        vm.prank(alice);
+        vm.expectRevert(HongbaoBox.NothingToClaim.selector);
+        box.claim(alice, bob);
+        vm.expectRevert(HongbaoBox.NotRecipient.selector);
+        vm.prank(bob);
+        box.claim(alice, bob);
+    }
+
+    function testCreditsAccumulateAcrossPacketsAndSurvivePartialClaims() public {
+        uint256 first = _create(1 ether, 2, false);
+        uint256 second = _create(2 ether, 2, false);
+        _grab(first, alice);
+        _grab(second, alice);
+        vm.warp(box.packet(second).expiry);
+        imd.setBlocked(creator);
+        box.refund(first);
+        box.refund(second);
+        uint256 expected = box.packet(first).amount / 2 + box.packet(second).amount / 2;
+        assertEq(box.claimable(creator), expected);
+        assertEq(box.totalEscrow(), expected);
+        _assertAccounting();
+        // Unsolicited IMD above the credits is still recoverable, but never the credits themselves.
+        imd.mint(address(box), 0.25 ether);
+        vm.prank(bob);
+        assertEq(box.recoverSurplus(), 0.25 ether);
+        assertEq(box.totalEscrow(), expected);
         _assertAccounting();
         imd.setBlocked(address(0));
+        box.claim(creator, creator);
+        assertEq(box.totalEscrow(), 0);
+        _assertAccounting();
+    }
+
+    function testSettleCreditsSilentNoOpAndFalseReturnsButRejectsInexactMoves() public {
+        uint256 id = _create(1 ether, 2, true);
+        _grab(id, alice);
+        _grab(id, bob);
+        vm.warp(box.settlementTime(id));
+        // Balances moving by the wrong amount is a broken token, not a refused recipient: whole batch reverts.
+        imd.setMode(MockIMD.Mode.FeeOut);
+        vm.expectRevert(HongbaoBox.InexactTransfer.selector);
+        box.settle(id);
+        imd.setMode(MockIMD.Mode.SenderFeeOut);
+        vm.expectRevert(HongbaoBox.InexactTransfer.selector);
+        box.settle(id);
+        _assertUnpaidLucky(id, 2);
+        // Nothing moving at all is treated like a refusal: credited, never lost.
+        imd.setMode(MockIMD.Mode.FalseOut);
+        box.settle(id);
+        uint256 net = box.packet(id).amount;
+        assertEq(box.claimable(alice), net / 2);
+        assertEq(box.claimable(bob), net - net / 2);
+        assertEq(imd.balanceOf(address(box)), net);
+        _assertAccounting();
+        imd.setMode(MockIMD.Mode.Normal);
+        box.claim(alice, alice);
+        box.claim(bob, bob);
+        assertEq(imd.balanceOf(alice) + imd.balanceOf(bob), net);
+        _assertAccounting();
+
+        uint256 other = _create(1 ether, 1, true);
+        _grab(other, carol);
+        vm.warp(box.settlementTime(other));
+        imd.setMode(MockIMD.Mode.NoOpOut);
+        box.settle(other);
+        assertEq(box.claimable(carol), box.packet(other).amount);
+        _assertAccounting();
+    }
+
+    function testClaimRejectsReentryAndCannotRecoverCreditsAsSurplus() public {
+        uint256 id = _create(1 ether, 2, false);
+        _grab(id, alice);
+        vm.warp(box.packet(id).expiry);
+        imd.setBlocked(creator);
         box.refund(id);
+        imd.setBlocked(address(0));
+        imd.setCallback(address(box), abi.encodeCall(box.recoverSurplus, ()), false, true);
+        box.claim(creator, creator);
+        _assertGuardedCallback();
+        imd.setCallback(address(box), abi.encodeCall(box.claim, (creator, creator)), false, true);
+        _create(1 ether, 1, false);
+        _assertGuardedCallback();
         _assertAccounting();
     }
 

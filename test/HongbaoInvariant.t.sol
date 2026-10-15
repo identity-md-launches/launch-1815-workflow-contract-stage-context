@@ -19,6 +19,7 @@ contract HongbaoHandler is Test {
     uint256 public reveals;
     uint256 public settlements;
     uint256 public refunds;
+    uint256 public claims;
     uint256 public totalBurned;
     uint256 public constant FUNDING = 1_000_000 ether;
 
@@ -60,6 +61,8 @@ contract HongbaoHandler is Test {
         if (p.state != HongbaoBox.State.Open || p.grabbed == p.slots || block.timestamp >= p.expiry) return;
         address recipient = address(uint160(0x1000 + bound(recipientSeed, 0, 11)));
         if (box.hasGrabbed(id, recipient)) return;
+        // An equal grab pays immediately and reverts for a blocked recipient; lucky grabs only record.
+        if (!p.lucky && recipient == imd.blockedRecipient()) return;
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, box.grabDigest(id, recipient));
         box.grab(id, recipient, abi.encodePacked(r, s, v));
         ++grabs;
@@ -73,9 +76,40 @@ contract HongbaoHandler is Test {
         if (p.state != HongbaoBox.State.Open || !p.lucky || (p.grabbed < p.slots && block.timestamp < p.expiry)) {
             return;
         }
+        // Reveal is atomic by design: it reverts while IMD refuses any recipient of the batch.
+        address blocked = imd.blockedRecipient();
+        if (blocked == address(this)) return;
+        (address[] memory recipients,) = box.grabbers(id);
+        for (uint256 i; i < recipients.length; ++i) {
+            if (recipients[i] == blocked) return;
+        }
         box.reveal(id, secrets[id]);
         ++reveals;
         _rememberTerminal(id);
+    }
+
+    /// @dev Models the IMD owner's blocklist: at most one address is refused at a time, or none.
+    function blockRecipient(uint256 seed) external {
+        uint256 pick = bound(seed, 0, 13);
+        address target = pick == 13 ? address(0) : pick == 12 ? address(this) : address(uint160(0x1000 + pick));
+        imd.setBlocked(target);
+    }
+
+    function claimCredit(uint256 seed) external {
+        address recipient = _actor(bound(seed, 0, 12));
+        if (box.claimable(recipient) == 0 || recipient == imd.blockedRecipient()) return;
+        box.claim(recipient, recipient);
+        ++claims;
+    }
+
+    function claimable() external view returns (uint256 sum) {
+        for (uint256 i; i <= 12; ++i) {
+            sum += box.claimable(_actor(i));
+        }
+    }
+
+    function _actor(uint256 index) private view returns (address) {
+        return index == 12 ? address(this) : address(uint160(0x1000 + index));
     }
 
     function settlePacket(uint256 packetSeed) external {
@@ -102,7 +136,8 @@ contract HongbaoHandler is Test {
         vm.warp(vm.getBlockTimestamp() + bound(delta, 0, 2 days));
     }
 
-    /// @dev Invariant teardown proves all modeled obligations remain reachable, even with lost secrets.
+    /// @dev Invariant teardown proves all modeled obligations remain reachable, even with lost secrets
+    /// and a recipient IMD refuses: fallbacks still close every packet, and credits drain once unblocked.
     function closeAll() external {
         vm.warp(vm.getBlockTimestamp() + 8 days);
         for (uint256 id = 1; id <= creates; ++id) {
@@ -111,6 +146,11 @@ contract HongbaoHandler is Test {
             if (p.lucky) box.settle(id);
             else box.refund(id);
             _rememberTerminal(id);
+        }
+        imd.setBlocked(address(0));
+        for (uint256 i; i <= 12; ++i) {
+            address recipient = _actor(i);
+            if (box.claimable(recipient) != 0) box.claim(recipient, recipient);
         }
     }
 
@@ -131,13 +171,15 @@ contract HongbaoInvariantTest is StdInvariant, Test {
         imd = new MockIMD();
         box = new HongbaoBox(address(imd));
         handler = new HongbaoHandler(box, imd);
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](8);
         selectors[0] = handler.createPacket.selector;
         selectors[1] = handler.grabPacket.selector;
         selectors[2] = handler.revealPacket.selector;
         selectors[3] = handler.settlePacket.selector;
         selectors[4] = handler.refundPacket.selector;
         selectors[5] = handler.advanceTime.selector;
+        selectors[6] = handler.blockRecipient.selector;
+        selectors[7] = handler.claimCredit.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -171,6 +213,7 @@ contract HongbaoInvariantTest is StdInvariant, Test {
             }
             assertEq(box.remaining(id), owed);
         }
+        liabilities += handler.claimable();
         assertEq(imd.balanceOf(address(box)), liabilities);
         assertEq(box.totalEscrow(), liabilities);
     }
@@ -205,13 +248,20 @@ contract HongbaoInvariantTest is StdInvariant, Test {
         handler.createPacket(0, 2, false, 10 minutes);
         handler.grabPacket(4, 3);
         handler.advanceTime(2 days);
+        handler.blockRecipient(2); // the only grabber of packet 3 is refused by IMD
         handler.settlePacket(3);
         handler.refundPacket(4);
+        assertGt(box.claimable(address(0x1002)), 0);
+        handler.claimCredit(2); // still blocked: skipped
+        assertEq(handler.claims(), 0);
+        handler.blockRecipient(13);
+        handler.claimCredit(2);
         assertEq(handler.creates(), 4);
         assertEq(handler.grabs(), 4);
         assertEq(handler.reveals(), 1);
         assertEq(handler.settlements(), 1);
         assertEq(handler.refunds(), 1);
+        assertEq(handler.claims(), 1);
         afterInvariant();
     }
 }

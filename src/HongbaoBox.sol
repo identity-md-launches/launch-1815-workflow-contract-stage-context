@@ -25,7 +25,8 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
 
     IERC20 public immutable imd;
     uint256 public nextPacketId = 1;
-    /// @notice Sum of IMD still owed by all open packets, excluding unsolicited transfers.
+    /// @notice All IMD the box owes: open packets' remaining amounts plus deferred `claimable` credits.
+    /// Unsolicited transfers are excluded and recoverable through `recoverSurplus`.
     uint256 public totalEscrow;
 
     enum State {
@@ -56,6 +57,9 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
     mapping(uint256 => uint256) public filledAt;
     mapping(uint256 => uint256) public remaining;
     mapping(uint256 => address) public bestLuck;
+    /// @notice IMD owed to an address whose settle or refund transfer did not go through
+    /// (for example an IMD-side blocklist). Counted in `totalEscrow`; released through `claim`.
+    mapping(address => uint256) public claimable;
 
     error InvalidToken();
     error InvalidSlots();
@@ -78,6 +82,8 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
     error TooEarly(uint256 availableAt);
     error InexactTransfer();
     error NoSurplus();
+    error NotRecipient();
+    error NothingToClaim();
 
     event PacketCreated(
         uint256 indexed id,
@@ -99,6 +105,8 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
     event Settled(uint256 indexed id, uint256 payout, uint256 refundAmount);
     event Refunded(uint256 indexed id, address indexed creator, uint256 amount);
     event SurplusRecovered(address indexed recipient, uint256 amount);
+    event PayoutDeferred(uint256 indexed id, address indexed recipient, uint256 amount);
+    event Claimed(address indexed recipient, address indexed to, uint256 amount);
 
     /// @param imdAddress The launch's supplied IMD address on Robinhood Chain, not LaunchToken.
     /// @dev No external calls or code-presence requirements during factory deployment.
@@ -173,6 +181,7 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
 
     /// @notice Creator opens a full or expired lucky packet and atomically pays all recorded grabbers.
     /// @dev A reveal remains possible after the grace period until a settle transaction wins the race.
+    /// If IMD refuses any recipient the reveal reverts; `settle` then pays the rest and credits that one.
     function reveal(uint256 id, bytes32 secret) external nonReentrant {
         Packet storage p = _openPacket(id);
         if (!p.lucky) revert NotLucky();
@@ -184,6 +193,7 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
     }
 
     /// @notice After 24 hours from filling or expiry, anyone can trigger an equal fallback payout.
+    /// @dev Never blocked by one recipient: a share IMD refuses to deliver is credited in `claimable`.
     function settle(uint256 id) external nonReentrant {
         Packet storage p = _openPacket(id);
         if (!p.lucky) revert NotLucky();
@@ -193,6 +203,7 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
     }
 
     /// @notice After expiry, anyone can return an equal packet's unpaid amount to its creator.
+    /// @dev Always reaches the terminal state: a refund IMD refuses to deliver is credited in `claimable`.
     function refund(uint256 id) external nonReentrant {
         Packet storage p = _openPacket(id);
         if (p.lucky) revert NotEqual();
@@ -202,7 +213,20 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
         totalEscrow -= amount;
         p.state = State.Refunded;
         emit Refunded(id, p.creator, amount);
-        _pay(p.creator, amount);
+        _payOrCredit(id, p.creator, amount);
+    }
+
+    /// @notice Release a deferred credit. Anyone may pay it out to its recipient; only the recipient
+    /// may redirect it to another address, for example when IMD refuses transfers to the original one.
+    function claim(address recipient, address to) external nonReentrant returns (uint256 amount) {
+        if (to == address(0) || to == address(this)) revert InvalidRecipient();
+        if (msg.sender != recipient && to != recipient) revert NotRecipient();
+        amount = claimable[recipient];
+        if (amount == 0) revert NothingToClaim();
+        claimable[recipient] = 0;
+        totalEscrow -= amount;
+        emit Claimed(recipient, to, amount);
+        _pay(to, amount);
     }
 
     /// @notice Return the specified nine packet fields. Reverts for an unknown id.
@@ -280,10 +304,17 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
         } else {
             emit Settled(id, payout, refundAmount);
         }
+        // Reveal keeps the brief's all-or-nothing payout: a lucky result is never partially paid.
+        // Settle is the permissionless fallback, so it must finish even if IMD refuses a recipient.
         for (uint256 i; i < count; ++i) {
-            _pay(_grabbers[id][i], _shares[id][i]);
+            if (randomize) _pay(_grabbers[id][i], _shares[id][i]);
+            else _payOrCredit(id, _grabbers[id][i], _shares[id][i]);
         }
-        if (refundAmount != 0) _pay(p.creator, refundAmount);
+        if (randomize) {
+            if (refundAmount != 0) _pay(p.creator, refundAmount);
+        } else {
+            _payOrCredit(id, p.creator, refundAmount);
+        }
     }
 
     /// @dev Rejection sampling avoids modulo bias in the inclusive draw range. Hash inputs are
@@ -302,17 +333,44 @@ contract HongbaoBox is EIP712, ReentrancyGuard {
     }
 
     /// @dev Protect both escrow and recipients from fees, silent no-ops, or sender-side surcharges.
-    /// Reverts roll back the whole operation, including all earlier payouts of a batch.
+    /// Reverts roll back the whole operation. Used where a single recipient is being paid.
     function _pay(address recipient, uint256 amount) private {
         uint256 beforeBox = imd.balanceOf(address(this));
         uint256 beforeRecipient = imd.balanceOf(recipient);
         imd.safeTransfer(recipient, amount);
         uint256 afterBox = imd.balanceOf(address(this));
         uint256 afterRecipient = imd.balanceOf(recipient);
-        if (
-            afterBox > beforeBox || beforeBox - afterBox != amount || afterRecipient < beforeRecipient
-                || afterRecipient - beforeRecipient != amount
-        ) revert InexactTransfer();
+        if (!_exact(beforeBox, afterBox, beforeRecipient, afterRecipient, amount)) revert InexactTransfer();
+    }
+
+    /// @dev Best-effort payout for the permissionless fallbacks. A transfer IMD refuses (revert, false
+    /// return or silent no-op, with no balance moving) becomes a `claimable` credit that stays inside
+    /// `totalEscrow`, so one unreachable recipient cannot strand the others or the creator. A
+    /// transfer that moves balances inexactly still reverts the whole batch, as before.
+    function _payOrCredit(uint256 id, address recipient, uint256 amount) private {
+        if (amount == 0) return;
+        uint256 beforeBox = imd.balanceOf(address(this));
+        uint256 beforeRecipient = imd.balanceOf(recipient);
+        (bool ok, bytes memory data) = address(imd).call(abi.encodeCall(IERC20.transfer, (recipient, amount)));
+        bool returnedTrue = ok && (data.length == 0 || (data.length >= 32 && abi.decode(data, (uint256)) == 1));
+        uint256 afterBox = imd.balanceOf(address(this));
+        uint256 afterRecipient = imd.balanceOf(recipient);
+        if (returnedTrue && _exact(beforeBox, afterBox, beforeRecipient, afterRecipient, amount)) return;
+        if (afterBox != beforeBox || afterRecipient != beforeRecipient) revert InexactTransfer();
+        claimable[recipient] += amount;
+        totalEscrow += amount;
+        emit PayoutDeferred(id, recipient, amount);
+    }
+
+    function _exact(
+        uint256 beforeBox,
+        uint256 afterBox,
+        uint256 beforeRecipient,
+        uint256 afterRecipient,
+        uint256 amount
+    ) private pure returns (bool) {
+        return afterBox <= beforeBox && beforeBox - afterBox == amount && afterRecipient >= beforeRecipient
+            && afterRecipient - beforeRecipient == amount;
     }
 
     function _knownPacket(uint256 id) private view returns (Packet storage p) {
