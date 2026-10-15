@@ -1,0 +1,24 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "HONGBAO",
+    "symbol": "HONGBAO",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "HongbaoBox",
+      "constructorArgs": [
+        "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "LaunchToken sets its name and symbol to HONGBAO. HongbaoBox is an ownerless IMD red-packet contract configured with the supplied IMD token, independent of LaunchToken. No initialization calls are required. Lucky-packet creators can choose between revealing and allowing equal fallback settlement; Robinhood Chain's sequencer orders transactions. The factory supplies the liquidity pool, MerkleDistributor and initialization-only pool guard."
+}
