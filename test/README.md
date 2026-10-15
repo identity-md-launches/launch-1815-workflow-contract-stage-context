@@ -11,7 +11,7 @@ These tests supplement the accepted suite without changing its fixtures or produ
 
 | File | Additional evidence |
 | --- | --- |
-| `HongbaoAtomicity.t.sol` | All 20 combinations of five payout paths and four outbound token faults; snapshots prove failed transactions preserve balances, packet fields, shares, replay flags and liabilities. Retrying the same operation succeeds after removing the fault. Separate regressions fail the creator's recipient transfer and the final creator refund after earlier batch payouts. |
+| `HongbaoAtomicity.t.sol` | All 24 combinations of six payout paths (grab, reveal, settle, refund, surplus recovery, claim) and four outbound token faults. Faults that move balances inexactly, and every fault on grab/reveal/recovery/claim, revert; snapshots prove balances, packet fields, shares, replay flags, credits and liabilities are unchanged, and retrying after the fault succeeds. Refused transfers (false return, silent no-op) on settle/refund finish the packet, credit each recipient exactly what it was owed, stay outside surplus recovery and pay out through `claim`. Separate regressions fail the creator's recipient transfer and the final creator refund after earlier reveal payouts. |
 | `HongbaoArithmetic.t.sol` | 1,000 full-width amount cases and 1,000 funding-threshold cases. Explicit maximum-uint256 tests cover a 200-recipient reveal, a 199-of-200 fallback and an empty reveal. The proportional-payout oracle uses quotient/remainder decomposition rather than the production `mulDiv` implementation. |
 | `HongbaoLedgerInvariant.t.sol` | Six funded actors serve as creators, recipients and relayers across mixed equal/lucky packets. An independent ledger checks every actor's exact IMD balance, packet obligations and metadata, burn accounting, unsolicited transfers and surplus recovery. Invalid grabs and terminal mutators are interleaved with valid calls. Teardown settles/refunds every open packet without using reveal secrets. |
 | `LaunchTokenInvariant.t.sol` | Four holders run transfers, self-transfers, arbitrary approvals, revocations, delegated transfers and expected failures. A separate balance/allowance ledger checks fixed supply, finite allowance consumption, infinite allowances and rollback on failure. |
@@ -27,5 +27,5 @@ checks the exact deterministic RNG output.
 The suite runs offline against local ERC-20 fixtures. It does not establish the current behavior,
 code or gas costs of the requester-supplied IMD contract on Robinhood Chain. Live integration
 verification against that token remains outstanding. Exact accounting and drainability assume
-a functioning, nonrebasing IMD token; failure-path tests prove atomic rollback and retry when
-token transfers fail, rather than assuming a paused or blocklisted token can be overridden.
+a functioning, nonrebasing IMD token; failure-path tests prove atomic rollback and retry, or deferral to
+`claimable` credits on the fallback paths, rather than assuming a paused or blocklisted token can be overridden.

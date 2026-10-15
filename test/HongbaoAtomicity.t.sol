@@ -8,10 +8,14 @@ import {MockIMD} from "./helpers/MockIMD.sol";
 
 contract HongbaoAtomicityTest is HongbaoTestBase {
     /// @dev Enumerate this finite matrix so every payout path sees every outbound failure mode.
+    /// Grab, reveal, recoverSurplus and claim pay one recipient or keep reveal all-or-nothing, so every
+    /// fault reverts and rolls back. Settle and refund are the permissionless fallbacks: a refused
+    /// transfer (false return or silent no-op, no balance moved) becomes a claimable credit, while a
+    /// transfer that moves balances inexactly still reverts the batch.
     function testAllOutboundModesRollbackAndRetryEveryPayoutPath() public {
         MockIMD.Mode[4] memory modes =
             [MockIMD.Mode.FeeOut, MockIMD.Mode.SenderFeeOut, MockIMD.Mode.NoOpOut, MockIMD.Mode.FalseOut];
-        for (uint256 operation; operation < 5; ++operation) {
+        for (uint256 operation; operation < 6; ++operation) {
             for (uint256 mode; mode < modes.length; ++mode) {
                 setUp();
                 uint256 equal = _create(1 ether, 2, false);
@@ -23,6 +27,19 @@ contract HongbaoAtomicityTest is HongbaoTestBase {
                 imd.mint(address(box), 1 ether);
                 bytes memory signature = _sign(box, equal, bob);
                 if (operation != 0) vm.warp(box.settlementTime(lucky));
+                if (operation == 5) {
+                    // Create credits for creator, bob and carol through a refused fallback settlement.
+                    imd.setMode(MockIMD.Mode.FalseOut);
+                    box.settle(lucky);
+                    imd.setMode(MockIMD.Mode.Normal);
+                    assertGt(box.claimable(bob), 0, "settle credited the refused share");
+                    assertEq(imd.balanceOf(address(box)), box.totalEscrow() + 1 ether, "credits stay in escrow");
+                }
+                bool refused = modes[mode] == MockIMD.Mode.NoOpOut || modes[mode] == MockIMD.Mode.FalseOut;
+                if ((operation == 2 || operation == 3) && refused) {
+                    _assertFallbackCredits(operation, equal, lucky, modes[mode]);
+                    continue;
+                }
                 bytes32 beforeState = _snapshot();
                 imd.setMode(modes[mode]);
                 if (modes[mode] == MockIMD.Mode.FalseOut) {
@@ -43,13 +60,56 @@ contract HongbaoAtomicityTest is HongbaoTestBase {
                     assertEq(uint256(box.packet(lucky).state), uint256(HongbaoBox.State.Settled));
                 } else if (operation == 3) {
                     assertEq(uint256(box.packet(equal).state), uint256(HongbaoBox.State.Refunded));
-                } else {
+                } else if (operation == 4) {
                     assertEq(imd.balanceOf(relayer), 1 ether);
+                } else {
+                    assertEq(box.claimable(bob), 0, "retried claim pays the credit");
                 }
                 if (operation != 4) box.recoverSurplus();
                 _assertAccounting();
             }
         }
+    }
+
+    /// @dev A refused fallback payout must finish the packet, credit every refused recipient exactly
+    /// what it was owed, move no tokens, and leave the credits claimable once the token recovers.
+    function _assertFallbackCredits(uint256 operation, uint256 equal, uint256 lucky, MockIMD.Mode mode) private {
+        uint256 boxBefore = imd.balanceOf(address(box));
+        uint256 creatorBefore = imd.balanceOf(creator);
+        uint256 bobBefore = imd.balanceOf(bob);
+        uint256 carolBefore = imd.balanceOf(carol);
+        uint256 owed = box.remaining(operation == 2 ? lucky : equal);
+        imd.setMode(mode);
+        _act(operation, equal, lucky, "");
+        imd.setMode(MockIMD.Mode.Normal);
+        assertEq(imd.balanceOf(address(box)), boxBefore, "refused transfers move nothing");
+        uint256 credited = box.claimable(creator) + box.claimable(bob) + box.claimable(carol);
+        assertEq(credited, owed, "every refused unit is credited exactly once");
+        if (operation == 2) {
+            assertEq(uint256(box.packet(lucky).state), uint256(HongbaoBox.State.Settled));
+            assertGt(box.claimable(bob), 0);
+            assertGt(box.claimable(carol), 0);
+        } else {
+            assertEq(uint256(box.packet(equal).state), uint256(HongbaoBox.State.Refunded));
+            assertEq(box.claimable(creator), owed);
+        }
+        assertEq(imd.balanceOf(address(box)), box.totalEscrow() + 1 ether, "credits stay in escrow");
+        vm.expectRevert(HongbaoBox.PacketClosed.selector);
+        _act(operation, equal, lucky, "");
+        // Surplus recovery cannot take credits; only the 1 ether unsolicited transfer is surplus.
+        vm.prank(relayer);
+        box.recoverSurplus();
+        assertEq(imd.balanceOf(relayer), 1 ether);
+        uint256 creatorCredit = box.claimable(creator);
+        uint256 bobCredit = box.claimable(bob);
+        uint256 carolCredit = box.claimable(carol);
+        if (creatorCredit != 0) box.claim(creator, creator);
+        if (bobCredit != 0) box.claim(bob, bob);
+        if (carolCredit != 0) box.claim(carol, carol);
+        assertEq(imd.balanceOf(creator), creatorBefore + creatorCredit);
+        assertEq(imd.balanceOf(bob), bobBefore + bobCredit);
+        assertEq(imd.balanceOf(carol), carolBefore + carolCredit);
+        _assertAccounting();
     }
 
     function testRevealCreatorRecipientFailureRollsBackEarlierPayoutsAndWinner() public {
@@ -92,9 +152,11 @@ contract HongbaoAtomicityTest is HongbaoTestBase {
             box.settle(lucky);
         } else if (operation == 3) {
             box.refund(equal);
-        } else {
+        } else if (operation == 4) {
             vm.prank(relayer);
             box.recoverSurplus();
+        } else {
+            box.claim(bob, bob);
         }
     }
 
@@ -133,5 +195,8 @@ contract HongbaoAtomicityTest is HongbaoTestBase {
                 )
             );
         }
+        result = keccak256(
+            abi.encode(result, box.claimable(creator), box.claimable(alice), box.claimable(bob), box.claimable(carol))
+        );
     }
 }
